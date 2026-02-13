@@ -622,93 +622,117 @@ const SHORT_LABELS = {
   "Temporary Measure": "Temp.",
 };
 
-function RiskHeatmap({ filter, ssAgg, onDrillToSub }) {
+function RiskHeatmap({ filter, screen, onDrillToSub }) {
   const [sortCol, setSortCol] = useState(null);
   const [sortDir, setSortDir] = useState("desc");
   const [hoveredRow, setHoveredRow] = useState(null);
   const [hoveredCol, setHoveredCol] = useState(null);
+  const [riskFilters, setRiskFilters] = useState(() => Object.fromEntries(RISK_FACTORS.map(rf => [rf, ""])));
 
   const toggleSort = (col) => {
     if (sortCol === col) setSortDir(d => d === "desc" ? "asc" : "desc");
     else { setSortCol(col); setSortDir("desc"); }
   };
 
-  const [collapsed, setCollapsed] = useState(new Set());
-  const toggleCollapse = (sec) => setCollapsed(prev => { const n = new Set(prev); n.has(sec) ? n.delete(sec) : n.add(sec); return n; });
+  const [collapsedSectors, setCollapsedSectors] = useState(new Set());
+  const [collapsedSubs, setCollapsedSubs] = useState(new Set());
+  const toggleSector = (sec) => setCollapsedSectors(prev => { const n = new Set(prev); n.has(sec) ? n.delete(sec) : n.add(sec); return n; });
+  const toggleSub = (key) => setCollapsedSubs(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
 
+  const setRF = (rf, val) => setRiskFilters(prev => ({ ...prev, [rf]: val }));
+
+  // Build company rows with their risk factors
   const grouped = useMemo(() => {
-    // reverse RISK_LOOKUP to map RISK_RAW key -> screen sector & subSector
-    const riskToSector = {};
-    const riskToScreenSub = {};
-    Object.entries(RISK_LOOKUP).forEach(([k, v]) => {
-      const [sec, sub] = k.split("|");
-      if (!riskToSector[v]) riskToSector[v] = sec;
-      if (!riskToScreenSub[v]) riskToScreenSub[v] = sub;
-    });
-    let subs = Object.keys(RISK_RAW).map(sub => {
-      const risks = RISK_RAW[sub];
-      const score = Object.values(risks).reduce((s, v) => s + (RISK_VAL[v] ?? 0), 0);
-      const pct = Math.round((score / maxRisk) * 100);
-      const sector = riskToSector[sub] || null;
-      const screenSub = riskToScreenSub[sub] || sub;
-      return { sub, risks, score, pct, sector, screenSub };
-    });
-    if (filter.size > 0) subs = subs.filter(s => s.sector && filter.has(s.sector));
-    // sort within groups
+    // Enrich each company with risk factors from its sub-sector
+    let companies = screen.map(s => {
+      const riskKey = RISK_LOOKUP[`${s.sector}|${s.subSector}`];
+      const risks = riskKey ? RISK_RAW[riskKey] : null;
+      return { ...s, risks, riskKey };
+    }).filter(s => s.risks != null);
+
+    // Apply sector filter
+    if (filter.size > 0) companies = companies.filter(s => filter.has(s.sector));
+
+    // Apply risk factor dropdown filters
+    for (const rf of RISK_FACTORS) {
+      const fv = riskFilters[rf];
+      if (fv) companies = companies.filter(s => s.risks[rf] === fv);
+    }
+
+    // Sort function
+    const riskValNum = { High: 2, Medium: 1, Low: 0 };
     const sortFn = (a, b) => {
-      if (sortCol === "score") return sortDir === "desc" ? b.pct - a.pct : a.pct - b.pct;
-      if (sortCol === "sub") return sortDir === "desc" ? b.sub.localeCompare(a.sub) : a.sub.localeCompare(b.sub);
+      if (sortCol === "score") return sortDir === "desc" ? (b.riskPct ?? 0) - (a.riskPct ?? 0) : (a.riskPct ?? 0) - (b.riskPct ?? 0);
+      if (sortCol === "ticker") return sortDir === "desc" ? b.ticker.localeCompare(a.ticker) : a.ticker.localeCompare(b.ticker);
+      if (sortCol === "company") return sortDir === "desc" ? b.companyName.localeCompare(a.companyName) : a.companyName.localeCompare(b.companyName);
       if (sortCol && RISK_FACTORS.includes(sortCol)) {
-        const v = { High: 2, Medium: 1, Low: 0 };
-        const diff = (v[b.risks[sortCol]] ?? 0) - (v[a.risks[sortCol]] ?? 0);
+        const diff = (riskValNum[b.risks[sortCol]] ?? 0) - (riskValNum[a.risks[sortCol]] ?? 0);
         return sortDir === "desc" ? diff : -diff;
       }
-      return a.sub.localeCompare(b.sub);
+      return a.ticker.localeCompare(b.ticker);
     };
-    // group by sector
+
+    // Group by sector → sub-sector
     const bySector = {};
-    subs.forEach(s => {
-      const sec = s.sector || "Other";
-      if (!bySector[sec]) bySector[sec] = [];
-      bySector[sec].push(s);
+    for (const c of companies) {
+      const sec = c.sector;
+      if (!bySector[sec]) bySector[sec] = {};
+      const sub = c.subSector;
+      if (!bySector[sec][sub]) bySector[sec][sub] = [];
+      bySector[sec][sub].push(c);
+    }
+
+    // Build structured output
+    const sectors = Object.keys(bySector).sort().map(sec => {
+      const subMap = bySector[sec];
+      const subs = Object.keys(subMap).sort().map(sub => {
+        const items = subMap[sub].sort(sortFn);
+        const avgPct = Math.round(items.reduce((s, c) => s + (c.riskPct ?? 0), 0) / items.length);
+        return { sub, items, avgPct };
+      });
+      const allItems = subs.flatMap(s => s.items);
+      const avgPct = allItems.length > 0 ? Math.round(allItems.reduce((s, c) => s + (c.riskPct ?? 0), 0) / allItems.length) : 0;
+      const totalCompanies = allItems.length;
+      return { sector: sec, subs, avgPct, totalCompanies };
     });
-    // sort each group internally
-    Object.values(bySector).forEach(arr => arr.sort(sortFn));
-    // compute sector avg risk and sort sectors by it (highest first)
-    const sectors = Object.keys(bySector).map(sec => {
-      const items = bySector[sec];
-      const avgPct = Math.round(items.reduce((s, r) => s + r.pct, 0) / items.length);
-      return { sector: sec, avgPct, items };
-    });
-    sectors.sort((a, b) => a.sector.localeCompare(b.sector));
     return sectors;
-  }, [filter, ssAgg, sortCol, sortDir]);
+  }, [filter, screen, sortCol, sortDir, riskFilters]);
 
-  const totalSubs = grouped.reduce((s, g) => s + g.items.length, 0);
+  const totalCompanies = grouped.reduce((s, g) => s + g.totalCompanies, 0);
+  const activeFilterCount = RISK_FACTORS.filter(rf => riskFilters[rf]).length;
 
-  const labelW = 180;
+  const labelW = 200;
+  const selectStyle = { background: C.inputBg, border: `1px solid ${C.inputBorder}`, borderRadius: 4, color: C.text, fontSize: 10, padding: "2px 4px", cursor: "pointer", minWidth: 38 };
+  const activeSelectStyle = { ...selectStyle, borderColor: C.accent };
 
   return (
     <div style={cardStyle}>
-      <h3 style={{ margin: "0 0 4px", fontSize: 15, color: C.text }}>Risk Factor Heatmap</h3>
-      <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textDim }}>
-        {totalSubs} sub-sectors across {grouped.length} sectors. Hover for details. Click column headers to sort. Click sector rows to collapse.
+      <h3 style={{ margin: "0 0 4px", fontSize: 15, color: C.text }}>Risk Factor Heatmap — Companies</h3>
+      <p style={{ margin: "0 0 8px", fontSize: 12, color: C.textDim }}>
+        {totalCompanies} companies across {grouped.length} sectors{activeFilterCount > 0 ? ` (${activeFilterCount} filter${activeFilterCount > 1 ? "s" : ""} active)` : ""}. Click column headers to sort. Click sector/sub-sector rows to collapse.
       </p>
       <div style={{ overflowX: "auto" }}>
         <table style={{ borderCollapse: "collapse", fontSize: 11, width: "100%" }}>
           <thead>
             <tr>
-              <th style={{ position: "sticky", left: 0, zIndex: 2, background: C.card, padding: "6px 8px", textAlign: "left", color: sortCol === "sub" ? C.accent : C.textDim, fontWeight: 600, borderBottom: `1px solid ${C.cardBorder}`, minWidth: labelW, cursor: "pointer" }}
-                onClick={() => toggleSort("sub")}>Sub-Sector</th>
+              <th style={{ position: "sticky", left: 0, zIndex: 2, background: C.card, padding: "6px 8px", textAlign: "left", color: C.textDim, fontWeight: 600, borderBottom: `1px solid ${C.cardBorder}`, minWidth: labelW }}></th>
               <th style={{ padding: "6px 4px", textAlign: "center", color: sortCol === "score" ? C.accent : C.textDim, fontWeight: 600, borderBottom: `1px solid ${C.cardBorder}`, minWidth: 52, cursor: "pointer" }}
                 onClick={() => toggleSort("score")}>Score</th>
               {RISK_FACTORS.map((rf, ci) => (
-                <th key={rf} style={{ padding: "6px 2px", textAlign: "center", color: sortCol === rf ? C.accent : C.textDim, fontWeight: 600, borderBottom: `1px solid ${C.cardBorder}`, minWidth: 42, cursor: "pointer", whiteSpace: "nowrap", position: "relative" }}
-                  onClick={() => toggleSort(rf)}
+                <th key={rf} style={{ padding: "4px 2px", textAlign: "center", color: sortCol === rf ? C.accent : C.textDim, fontWeight: 600, borderBottom: `1px solid ${C.cardBorder}`, minWidth: 42, cursor: "pointer", whiteSpace: "nowrap", position: "relative", verticalAlign: "bottom" }}
                   onMouseEnter={() => setHoveredCol(ci)}
-                  onMouseLeave={() => setHoveredCol(null)}
-                  title={rf}>
-                  {SHORT_LABELS[rf] || rf.slice(0, 5)}
+                  onMouseLeave={() => setHoveredCol(null)}>
+                  <div style={{ cursor: "pointer", marginBottom: 4 }} onClick={() => toggleSort(rf)} title={rf}>
+                    {SHORT_LABELS[rf] || rf.slice(0, 5)}
+                  </div>
+                  <select value={riskFilters[rf]} onChange={e => setRF(rf, e.target.value)}
+                    style={riskFilters[rf] ? activeSelectStyle : selectStyle}
+                    onClick={e => e.stopPropagation()}>
+                    <option value="">All</option>
+                    <option value="High">H</option>
+                    <option value="Medium">M</option>
+                    <option value="Low">L</option>
+                  </select>
                   {hoveredCol === ci && (
                     <div style={{ position: "absolute", top: "100%", left: "50%", transform: "translateX(-50%)", background: C.tooltipBg, border: `1px solid ${C.tooltipBorder}`, borderRadius: 4, padding: "4px 8px", zIndex: 10, whiteSpace: "nowrap", fontSize: 11, color: C.text, fontWeight: 400, pointerEvents: "none" }}>
                       {rf}
@@ -720,52 +744,92 @@ function RiskHeatmap({ filter, ssAgg, onDrillToSub }) {
           </thead>
           <tbody>
             {grouped.map(group => {
-              const isCollapsed = collapsed.has(group.sector);
-              const colCount = 2 + RISK_FACTORS.length;
+              const secCollapsed = collapsedSectors.has(group.sector);
               return [
-                <tr key={`sector-${group.sector}`}
-                  onClick={() => toggleCollapse(group.sector)}
+                /* Sector header row */
+                <tr key={`sec-${group.sector}`}
+                  onClick={() => toggleSector(group.sector)}
                   style={{ cursor: "pointer", background: C.bg, borderBottom: `1px solid ${C.cardBorder}` }}>
                   <td style={{ position: "sticky", left: 0, zIndex: 1, background: C.bg, padding: "7px 8px", fontWeight: 700, fontSize: 12, color: sectorColor(group.sector), borderBottom: `1px solid ${C.cardBorder}` }}>
-                    <span style={{ display: "inline-block", width: 12, fontSize: 10, color: C.textMuted, marginRight: 4 }}>{isCollapsed ? "\u25B6" : "\u25BC"}</span>
+                    <span style={{ display: "inline-block", width: 12, fontSize: 10, color: C.textMuted, marginRight: 4 }}>{secCollapsed ? "\u25B6" : "\u25BC"}</span>
                     {group.sector}
-                    <span style={{ fontWeight: 400, color: C.textDim, marginLeft: 6 }}>({group.items.length})</span>
+                    <span style={{ fontWeight: 400, color: C.textDim, marginLeft: 6 }}>({group.totalCompanies})</span>
                   </td>
                   <td style={{ padding: "7px 4px", textAlign: "center", fontWeight: 700, fontSize: 12, borderBottom: `1px solid ${C.cardBorder}`, color: group.avgPct >= 60 ? C.red : group.avgPct >= 30 ? C.amber : C.green }}>
                     {group.avgPct}%
                   </td>
                   {RISK_FACTORS.map(rf => <td key={rf} style={{ borderBottom: `1px solid ${C.cardBorder}` }} />)}
                 </tr>,
-                ...(!isCollapsed ? group.items.map((row, ri) => (
-                  <tr key={row.sub}
-                    onMouseEnter={() => setHoveredRow(row.sub)}
-                    onMouseLeave={() => setHoveredRow(null)}
-                    onClick={() => onDrillToSub && onDrillToSub(row.sector, row.screenSub)}
-                    style={{ cursor: "pointer", background: hoveredRow === row.sub ? C.accentBg : ri % 2 === 0 ? C.rowBase : C.rowAlt }}>
-                    <td style={{ position: "sticky", left: 0, zIndex: 1, background: hoveredRow === row.sub ? C.accentBg : ri % 2 === 0 ? C.rowBase : C.rowAlt, padding: "5px 8px 5px 28px", color: C.text, fontWeight: 500, borderBottom: `1px solid ${C.cardBorder}`, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: labelW }}
-                      title={row.sub}>
-                      {row.sub.includes(": ") ? row.sub.split(": ").slice(1).join(": ") : row.sub}
-                    </td>
-                    <td style={{ padding: "5px 4px", textAlign: "center", fontWeight: 700, borderBottom: `1px solid ${C.cardBorder}`, color: row.pct >= 60 ? C.red : row.pct >= 30 ? C.amber : C.green }}>
-                      {row.pct}%
-                    </td>
-                    {RISK_FACTORS.map((rf, ci) => {
-                      const val = row.risks[rf] || "Low";
-                      return (
-                        <td key={rf} style={{ padding: "3px 2px", textAlign: "center", borderBottom: `1px solid ${C.cardBorder}` }}>
-                          <div style={{
-                            display: "inline-block", padding: "2px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600,
-                            color: val === "Low" ? "#4ade80" : val === "Medium" ? "#fbbf24" : "#f87171",
-                            background: RISK_BG[val], minWidth: 28,
-                            opacity: hoveredCol === ci || hoveredRow === row.sub ? 1 : 0.8,
-                          }}>
-                            {val === "Low" ? "L" : val === "Medium" ? "M" : "H"}
-                          </div>
+                /* Sub-sectors and companies */
+                ...(!secCollapsed ? group.subs.flatMap(subGroup => {
+                  const subKey = `${group.sector}|${subGroup.sub}`;
+                  const subCollapsed = collapsedSubs.has(subKey);
+                  // Get risks for this sub-sector
+                  const riskKey = RISK_LOOKUP[`${group.sector}|${subGroup.sub}`];
+                  const subRisks = riskKey ? RISK_RAW[riskKey] : null;
+                  return [
+                    /* Sub-sector header row */
+                    <tr key={`sub-${subKey}`}
+                      onClick={() => toggleSub(subKey)}
+                      style={{ cursor: "pointer", background: "rgba(255,255,255,0.02)", borderBottom: `1px solid ${C.cardBorder}` }}>
+                      <td style={{ position: "sticky", left: 0, zIndex: 1, background: "rgba(255,255,255,0.02)", padding: "5px 8px 5px 24px", fontWeight: 600, fontSize: 11, color: C.text, borderBottom: `1px solid ${C.cardBorder}` }}>
+                        <span style={{ display: "inline-block", width: 12, fontSize: 9, color: C.textMuted, marginRight: 4 }}>{subCollapsed ? "\u25B6" : "\u25BC"}</span>
+                        {subGroup.sub}
+                        <span style={{ fontWeight: 400, color: C.textDim, marginLeft: 6 }}>({subGroup.items.length})</span>
+                      </td>
+                      <td style={{ padding: "5px 4px", textAlign: "center", fontWeight: 600, fontSize: 11, borderBottom: `1px solid ${C.cardBorder}`, color: subGroup.avgPct >= 60 ? C.red : subGroup.avgPct >= 30 ? C.amber : C.green }}>
+                        {subGroup.avgPct}%
+                      </td>
+                      {RISK_FACTORS.map((rf, ci) => {
+                        const val = subRisks ? (subRisks[rf] || "Low") : "—";
+                        if (val === "—") return <td key={rf} style={{ borderBottom: `1px solid ${C.cardBorder}` }} />;
+                        return (
+                          <td key={rf} style={{ padding: "3px 2px", textAlign: "center", borderBottom: `1px solid ${C.cardBorder}` }}>
+                            <div style={{
+                              display: "inline-block", padding: "2px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600,
+                              color: val === "Low" ? "#4ade80" : val === "Medium" ? "#fbbf24" : "#f87171",
+                              background: RISK_BG[val], minWidth: 28,
+                              opacity: hoveredCol === ci ? 1 : 0.7,
+                            }}>
+                              {val === "Low" ? "L" : val === "Medium" ? "M" : "H"}
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>,
+                    /* Company rows */
+                    ...(!subCollapsed ? subGroup.items.map((row, ri) => (
+                      <tr key={row.ticker}
+                        onMouseEnter={() => setHoveredRow(row.ticker)}
+                        onMouseLeave={() => setHoveredRow(null)}
+                        style={{ background: hoveredRow === row.ticker ? C.accentBg : ri % 2 === 0 ? C.rowBase : C.rowAlt }}>
+                        <td style={{ position: "sticky", left: 0, zIndex: 1, background: hoveredRow === row.ticker ? C.accentBg : ri % 2 === 0 ? C.rowBase : C.rowAlt, padding: "4px 8px 4px 44px", color: C.text, fontWeight: 400, fontSize: 11, borderBottom: `1px solid ${C.cardBorder}`, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: labelW }}
+                          title={`${row.ticker} — ${row.companyName}`}>
+                          <span style={{ fontWeight: 600, color: C.accent, marginRight: 6 }}>{row.ticker}</span>
+                          <span style={{ color: C.textDim }}>{row.companyName}</span>
                         </td>
-                      );
-                    })}
-                  </tr>
-                )) : [])
+                        <td style={{ padding: "4px 4px", textAlign: "center", fontWeight: 600, borderBottom: `1px solid ${C.cardBorder}`, color: (row.riskPct ?? 0) >= 60 ? C.red : (row.riskPct ?? 0) >= 30 ? C.amber : C.green }}>
+                          {row.riskPct != null ? row.riskPct + "%" : "—"}
+                        </td>
+                        {RISK_FACTORS.map((rf, ci) => {
+                          const val = row.risks[rf] || "Low";
+                          return (
+                            <td key={rf} style={{ padding: "3px 2px", textAlign: "center", borderBottom: `1px solid ${C.cardBorder}` }}>
+                              <div style={{
+                                display: "inline-block", padding: "2px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600,
+                                color: val === "Low" ? "#4ade80" : val === "Medium" ? "#fbbf24" : "#f87171",
+                                background: RISK_BG[val], minWidth: 28,
+                                opacity: hoveredCol === ci || hoveredRow === row.ticker ? 1 : 0.8,
+                              }}>
+                                {val === "Low" ? "L" : val === "Medium" ? "M" : "H"}
+                              </div>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    )) : [])
+                  ];
+                }) : [])
               ];
             }).flat()}
           </tbody>
@@ -827,7 +891,7 @@ export default function Dashboard() {
       <FilterBar filter={filter} setFilter={setFilter} />
       {tab === 0 && <MarginRiskTab key={resetKey} filter={filter} screen={filteredScreen} ssAgg={fSSAgg} sectorAgg={fSectorAgg} initDrill={initDrill} />}
       {tab === 1 && <ValRiskTab key={resetKey} filter={filter} screen={filteredScreen} ssAgg={fSSAgg} sectorAgg={fSectorAgg} />}
-      {tab === 2 && <RiskHeatmap key={resetKey} filter={filter} ssAgg={fSSAgg} onDrillToSub={handleHeatmapDrill} />}
+      {tab === 2 && <RiskHeatmap key={resetKey} filter={filter} screen={filteredScreen} onDrillToSub={handleHeatmapDrill} />}
     </div>
   );
 }
